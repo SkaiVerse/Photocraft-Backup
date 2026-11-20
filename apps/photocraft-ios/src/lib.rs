@@ -706,20 +706,10 @@ impl Host {
     }
 
     /// The Pencil force (1.0 is an average touch) turned into a 0..1 pressure, with the
-    /// `pressure_divisor` setting how hard the Pencil must be pressed. A felt tip has a dead
-    /// zone and tapers in and out: the first and last samples of a stroke are never hard, and
-    /// a light lift barely marks the paper.
-    fn pressure_curve(&self, force: f32, phase: i32) -> f32 {
-        let raw = (force / self.pressure_divisor).clamp(0.0, 1.0);
-        if phase == 0 {
-            // The tip is just touching: nothing marks until it presses in.
-            return (raw * 2.0).min(1.0);
-        }
-        if phase == 2 {
-            // Lifting off: the pressure falls away before the tip leaves.
-            return raw * 0.5;
-        }
-        raw
+    /// `pressure_divisor` setting how hard the Pencil must be pressed. Kept simple and stable:
+    /// the smoothing lives in the shell, and the stroke never gets a hard start or end.
+    fn pressure_curve(&self, force: f32, _phase: i32) -> f32 {
+        (force / self.pressure_divisor).clamp(0.0, 1.0)
     }
 
     /// An event for a few frames from now.
@@ -821,12 +811,11 @@ impl Host {
         let Some(g) = self.gesture.take() else { return };
         match g.mode {
             GMode::Pending => {
-                let draws = g.pen;
                 let quick = g.t0.elapsed() < Duration::from_millis(500);
-                // A quick tap clicks. Only the Pencil taps the picture; a finger tap on the
-                // picture is a nudge, never a select. A finger on our own buttons (the assist
-                // puck, the undo column) still taps them.
-                if !cancelled && !g.consumed && quick && (g.host_ui || draws) {
+                // A quick tap clicks. A finger may tap anything that is not the picture (a tool
+                // button, a panel, our own puck); on the picture a finger is a nudge, never a
+                // select, so only the Pencil (and the mouse) can tap it.
+                if !cancelled && !g.consumed && quick && (g.pen || !g.on_canvas) {
                     self.click(g.start.0, g.start.1, egui::PointerButton::Primary, false);
                 }
             }
@@ -838,6 +827,21 @@ impl Host {
             }
             GMode::Scroll | GMode::Pan => self.post(1, egui::Event::PointerGone),
         }
+    }
+
+    /// Releases a stroke that is still down: sends the button-up, clears the feed and lets go of
+    /// the pen, so the canvas can never keep painting after the Pencil has left the screen. A
+    /// finger landing while a stroke is somehow still down calls this first.
+    fn end_pen(&mut self, x: f32, y: f32) {
+        if !self.pen_down {
+            return;
+        }
+        self.pen_down = false;
+        let pos = self.pt(x, y);
+        let m = self.modifiers;
+        self.push(egui::Event::PointerMoved(pos));
+        self.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
+        self.feed.set(None);
     }
 
     /// A shortcut pressed and released, like a key on a keyboard (exactly these modifiers).
@@ -1204,9 +1208,7 @@ pub unsafe extern "C" fn pc_pen(
         let pos = h.pt(x, y);
         let m = h.modifiers;
         // The shell sends the Pencil's force (1.0 is an average touch); full pressure is reached
-        // at `pressure_divisor`. The curve is what a felt tip feels like: a dead zone at the
-        // start, a taper in as the stroke begins and out as it ends, so the first and last
-        // samples are never hard.
+        // at `pressure_divisor`.
         let sample = PenSample {
             pressure: h.pressure_curve(pressure, phase),
             tilt_x,
@@ -1240,11 +1242,7 @@ pub unsafe extern "C" fn pc_pen(
             }
             _ => {
                 if h.pen_down {
-                    h.pen_down = false;
-                    h.push(egui::Event::PointerMoved(pos));
-                    h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
-                    // The stroke's last samples keep their pressure; nothing is held after this.
-                    h.feed.set(None);
+                    h.end_pen(x, y);
                 } else if h.gesture.is_some_and(|g| g.pen) {
                     h.gesture_end(x, y, phase == 3);
                 }
@@ -1285,7 +1283,12 @@ pub unsafe extern "C" fn pc_finger(h: *mut c_void, phase: c_int, x: f32, y: f32,
     if let Some(h) = unsafe { host(h) } {
         h.set_modifiers(to_mods(mods));
         match phase {
-            0 => h.gesture_begin(x, y, false),
+            0 => {
+                // A finger landing always means no stroke is in progress. Release any stroke that
+                // is somehow still down, so a lost Pencil lift can never make fingers paint.
+                h.end_pen(x, y);
+                h.gesture_begin(x, y, false);
+            }
             1 => {
                 if h.gesture.is_some_and(|g| !g.pen) {
                     h.gesture_move(x, y);
