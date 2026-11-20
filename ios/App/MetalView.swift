@@ -57,8 +57,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         var index: NSNumber?
         var ready: Bool
         var time: CFTimeInterval
-        /// A hint from iPadOS about where the tip will be. Rendered ahead of the ink, never written.
-        var predicted: Bool = false
     }
     private var penQueue: [PenItem] = []
     private var smoothedPressure: Float = 0
@@ -82,7 +80,14 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     /// Forgets touches that have ended without being reported, so nothing ever gets stuck.
     private func pruneTouches() {
-        if let t = pencilTouch, t.phase == .ended || t.phase == .cancelled { pencilTouch = nil }
+        if let t = pencilTouch, t.phase == .ended || t.phase == .cancelled {
+            // The lift was not reported through touchesEnded. Release the stroke here, or the
+            // canvas would keep painting on every later touch.
+            let p = t.location(in: self)
+            if let h = handle { pc_pen(h, Float(p.x), Float(p.y), 2, 0, 0, 0, 0, 0) }
+            pencilTouch = nil
+            pencilLastSeen = CACurrentMediaTime()
+        }
         directTouches = directTouches.filter { $0.phase != .ended && $0.phase != .cancelled }
         ignoredTouches = ignoredTouches.filter { $0.phase != .ended && $0.phase != .cancelled }
         if let f = fingerTouch, f.phase == .ended || f.phase == .cancelled { cancelFinger() }
@@ -671,31 +676,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 ready: !waiting,
                 time: CACurrentMediaTime()))
         }
-        // iPadOS also predicts where the tip will be before the next real touch arrives. Feed
-        // those into the queue too: they are rendered ahead of the ink, so a fast stroke keeps
-        // the tip in front of the line. When the real sample lands it replaces them.
-        if phase == 1,
-           let predicted = event?.predictedTouches(for: touch),
-           !predicted.isEmpty
-        {
-            for c in predicted {
-                var roll: CGFloat = 0
-                if #available(iOS 17.5, *) { roll = c.rollAngle }
-                penQueue.append(PenItem(
-                    phase: 1,
-                    location: c.preciseLocation(in: self),
-                    force: c.maximumPossibleForce > 0 ? c.force : 1,
-                    altitude: c.altitudeAngle,
-                    azimuth: c.azimuthUnitVector(in: self),
-                    roll: roll,
-                    mods: mods,
-                    index: nil,
-                    ready: true,
-                    time: CACurrentMediaTime(),
-                    predicted: true))
-            }
-        }
-        flushPen(all: false)
+        // A lift or a cancel must go out at once, so the app never keeps painting after the
+        // Pencil has left the screen.
+        flushPen(all: phase >= 2)
     }
 
     /// iPadOS refines the Pencil's pressure a few milliseconds after the touch. Matching the
@@ -707,19 +690,14 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             penQueue[i].force = t.force
             penQueue[i].altitude = t.altitudeAngle
             if !t.estimatedPropertiesExpectingUpdates.contains(.force) { penQueue[i].ready = true }
-            // The real sample has landed: drop the predictions it superseded, so the ink never
-            // draws the same point twice. (Predicted samples sit behind it in the queue.)
-            if i + 1 < penQueue.count { penQueue.removeSubrange(i + 1 ..< penQueue.count) }
         }
         flushPen(all: false)
     }
 
     private func flushPen(all: Bool) {
         let now = CACurrentMediaTime()
-        // A sample waits at most about one frame for its refined pressure: the ink keeps up with
-        // the tip. Predicted samples are already ready, so they go out immediately and stay ahead
-        // of the ink even when a real sample is still waiting for its pressure.
-        while let first = penQueue.first, first.predicted || first.ready || all || now - first.time > 0.012 {
+        // A sample waits at most about one frame for its refined pressure: the ink keeps up with the tip.
+        while let first = penQueue.first, first.ready || all || now - first.time > 0.012 {
             penQueue.removeFirst()
             sendPen(first)
         }
@@ -727,21 +705,14 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     private func sendPen(_ item: PenItem) {
         guard let h = handle else { return }
-        // The Pencil's force (1.0 is an average touch). Predicted samples are real strokes drawn
-        // ahead of the ink; they are dropped when the sample they predict lands, so a real
-        // sample landing later cannot double-draw.
-        let force = item.predicted ? Float(max(0, min(4.5, item.force))) : smoothForce(item.force, item.phase)
+        // The Pencil's force (1.0 is an average touch); the Rust side turns it into pressure.
+        var pressure = Float(max(0, min(4.5, item.force)))
+        // A little smoothing of the pressure only (never of the position) evens out the response.
+        if item.phase == 0 { smoothedPressure = pressure } else { smoothedPressure = smoothedPressure * 0.5 + pressure * 0.5 }
+        pressure = smoothedPressure
         let (tx, ty) = MetalView.tilt(altitude: Double(item.altitude), azimuth: item.azimuth)
-        pc_pen(h, Float(item.location.x), Float(item.location.y), item.phase, force, tx, ty,
+        pc_pen(h, Float(item.location.x), Float(item.location.y), item.phase, pressure, tx, ty,
                Float(item.roll * 180 / CGFloat.pi), item.mods)
-    }
-
-    /// Pressure only (never the position): a little EMA evens out the response between the
-    /// raw force and iPadOS's refined value.
-    private func smoothForce(_ force: CGFloat, _ phase: Int32) -> Float {
-        let f = Float(max(0, min(4.5, force)))
-        if phase == 0 { smoothedPressure = f } else { smoothedPressure = smoothedPressure * 0.5 + f * 0.5 }
-        return smoothedPressure
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
