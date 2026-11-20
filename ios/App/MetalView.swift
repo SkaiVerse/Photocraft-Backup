@@ -22,6 +22,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private var handle: UnsafeMutableRawPointer?
     private var startFailed = false
     private var link: CADisplayLink?
+    /// True when a Pencil sample already drew a frame in this refresh, so the display link's
+    /// tick doesn't draw the same picture again a moment later.
+    private var drewSinceTick = false
+    /// True while `pc_frame` runs, so it can never be entered twice.
+    private var inFrame = false
     private var softKeyboard = false
     private var wantsKeyboard = false
     /// The person hid the on-screen keyboard while a text field is still active.
@@ -45,7 +50,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private var hoverLogged = 0
     private var keyLogged = 0
 
-    // Pencil samples wait a moment for iPadOS to deliver their true pressure.
+    // Pencil samples, in the order the system delivered them.
     private struct PenItem {
         var phase: Int32
         var location: CGPoint
@@ -184,12 +189,30 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     func setFocused(_ focused: Bool) { if let h = handle { pc_set_focused(h, focused ? 1 : 0) } }
 
     @objc private func tick() {
-        guard let h = handle else { return }
+        guard handle != nil else { return }
         if !suspendFocus && !isFirstResponder { _ = becomeFirstResponder() }
         repeatHeldKey()
         pruneTouches()
         flushPen(all: false)
+        // A Pencil sample drew the picture a moment ago, inside this same refresh: drawing now
+        // would only repeat it, and its frame would reach the screen a refresh later.
+        if !drewSinceTick {
+            drawFrame()
+        }
+        drewSinceTick = false
+    }
+
+    /// Draws a frame now and applies the flags it returns (bit 1: the on-screen keyboard is
+    /// wanted). Called by the display link and, right after a Pencil sample, by the touch
+    /// handler: drawing between refreshes puts the new ink in the next frame instead of the one
+    /// after it, which is what makes a stroke feel stuck to the tip. Returns whether a frame was
+    /// drawn (it is not, if one is already running).
+    @discardableResult
+    private func drawFrame() -> Bool {
+        guard let h = handle, !inFrame else { return false }
+        inFrame = true
         let flags = pc_frame(h)
+        inFrame = false
         let wants = (flags & 2) != 0
         if wants != wantsKeyboard {
             wantsKeyboard = wants
@@ -200,6 +223,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             softKeyboard = show
             reloadInputViews()
         }
+        return true
     }
 
     // MARK: Callbacks from Rust
@@ -655,7 +679,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         fingerTouch = nil
     }
 
-    /// Adds a Pencil sample. It is sent once its true pressure has arrived (a few milliseconds).
+    /// Adds a Pencil sample and shows it at once, so the ink stays under the tip.
     private func queuePen(_ touch: UITouch, phase: Int32, event: UIEvent?, mods: UInt32) {
         var samples: [UITouch] = [touch]
         if phase == 1, let more = event?.coalescedTouches(for: touch), !more.isEmpty { samples = more }
@@ -676,13 +700,21 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 ready: !waiting,
                 time: CACurrentMediaTime()))
         }
-        // A lift or a cancel must go out at once, so the app never keeps painting after the
-        // Pencil has left the screen.
-        flushPen(all: phase >= 2)
+        // Every sample goes out at once. Holding one back for iPadOS to refine its pressure
+        // would put the ink more than a frame behind the tip, which is what makes a stroke feel
+        // detached from the Pencil. The value it arrives with is close, and the shell smooths it.
+        flushPen(all: true)
+        // Draw now, between refreshes, so this sample reaches the screen at the next refresh
+        // rather than the one after it. At most one frame is drawn per refresh: a second sample
+        // in the same refresh is already queued for the frame the display link draws.
+        if phase >= 2 || !drewSinceTick {
+            drewSinceTick = drawFrame()
+        }
     }
 
-    /// iPadOS refines the Pencil's pressure a few milliseconds after the touch. Matching the
-    /// refined value to its sample gives an even, natural stroke.
+    /// iPadOS refines the Pencil's pressure a few milliseconds after the touch. A sample that is
+    /// still queued takes the refined value; samples normally go out at once, in which case only
+    /// the pose is refreshed here.
     override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) {
         for t in touches where t.type == .pencil {
             guard let index = t.estimationUpdateIndex,
@@ -696,8 +728,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     private func flushPen(all: Bool) {
         let now = CACurrentMediaTime()
-        // A sample waits at most about one frame for its refined pressure: the ink keeps up with the tip.
-        while let first = penQueue.first, first.ready || all || now - first.time > 0.012 {
+        // The queue is normally empty already (samples go out as they arrive); anything left
+        // goes out now, a fraction of a frame later at the most.
+        while let first = penQueue.first, first.ready || all || now - first.time > 0.002 {
             penQueue.removeFirst()
             sendPen(first)
         }
