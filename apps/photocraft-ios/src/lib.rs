@@ -623,6 +623,16 @@ impl Host {
         app.set_theme(&ctx, ThemeKind::Pro);
         app.set_wgpu(rs.clone());
         app.start_compositor(&ctx);
+        // Writing feel: the engine's stabiliser is a lag filter - the brush trails the pointer
+        // by `amount` and catches up afterwards - so a large amount is exactly what makes a
+        // stroke feel detached from the Pencil. Keep it barely on: about two milliseconds of
+        // trail, which steadies the line without the ink leaving the tip, and finish the stroke
+        // exactly where the tip lifted. The artist can still change it in the brush panel
+        // (Smoothing %).
+        app.session.tools.brush.smoothing.enabled = true;
+        app.session.tools.brush.smoothing.amount = 0.1;
+        app.session.tools.brush.smoothing.catch_up = true;
+        app.session.tools.brush.smoothing.catch_up_on_end = true;
         let feed = app.stylus.feed.clone();
 
         Ok(Host {
