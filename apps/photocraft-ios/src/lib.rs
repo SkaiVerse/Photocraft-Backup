@@ -273,29 +273,26 @@ fn touch_settings_path() -> Option<PathBuf> {
 }
 
 /// Finger drawing on/off and how firmly the Pencil must press, kept between launches.
-fn load_touch_settings() -> (bool, f32) {
-    let mut finger = false;
+fn load_touch_settings() -> f32 {
     let mut divisor = 2.5_f32;
     if let Some(text) = touch_settings_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         for line in text.lines() {
-            if let Some(v) = line.strip_prefix("finger_draws=") {
-                finger = v.trim() == "1";
-            } else if let Some(v) = line.strip_prefix("pressure_divisor=")
+            if let Some(v) = line.strip_prefix("pressure_divisor=")
                 && let Ok(n) = v.trim().parse::<f32>()
             {
                 divisor = n.clamp(1.0, 5.0);
             }
         }
     }
-    (finger, divisor)
+    divisor
 }
 
-fn save_touch_settings(finger: bool, divisor: f32) {
+fn save_touch_settings(divisor: f32) {
     if let Some(path) = touch_settings_path() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(path, format!("finger_draws={}\npressure_divisor={divisor}\n", finger as u8));
+        let _ = std::fs::write(path, format!("pressure_divisor={divisor}\n"));
     }
 }
 
@@ -305,7 +302,6 @@ enum TouchAction {
     Undo,
     Redo,
     Delete,
-    ToggleFinger,
     Softer,
     Firmer,
 }
@@ -383,13 +379,12 @@ fn icon_button(ui: &mut egui::Ui, size: f32, icon: Icon) -> egui::Response {
 /// The touch helpers, drawn inside the app's own interface:
 /// - Undo, Redo and Delete as icon buttons in a column near the toolbar, bottom-left of the picture;
 /// - a round assist button (drag it anywhere) that opens Command / Shift / Option / Control to hold
-///   down by touch (any number together), plus finger drawing and Pencil firmness.
+///   down by touch (any number together), plus Pencil firmness.
 fn touch_ui(
     ctx: &egui::Context,
     screen: egui::Rect,
     canvas: egui::Rect,
     st: &mut TouchUi,
-    finger_draws: bool,
     divisor: f32,
     out: &mut Vec<TouchAction>,
 ) {
@@ -468,10 +463,6 @@ fn touch_ui(
                         }
                     });
                     ui.horizontal(|ui| {
-                        let label = if finger_draws { "Finger: draw" } else { "Finger: pan" };
-                        if ui.add_sized([128.0, 44.0], egui::Button::new(label).selected(finger_draws)).clicked() {
-                            out.push(TouchAction::ToggleFinger);
-                        }
                         if ui
                             .add_sized([58.0, 44.0], egui::Button::new("Soft"))
                             .on_hover_text(format!("Pencil: a lighter touch is enough ({divisor:.1})"))
@@ -513,8 +504,6 @@ struct Host {
     feed: StylusFeed,
     pen_down: bool,
     wants_keyboard: bool,
-    /// Fingers draw on the canvas (otherwise they pan and zoom it, and only the Pencil draws).
-    finger_draws: bool,
     /// The Pencil force that counts as full pressure (1.0 is an average touch). Lower is softer.
     pressure_divisor: f32,
     touch: TouchUi,
@@ -660,8 +649,7 @@ impl Host {
             hw: egui::Modifiers::NONE,
             touch_shift: false,
             cursor: egui::CursorIcon::Default,
-            finger_draws: load_touch_settings().0,
-            pressure_divisor: load_touch_settings().1,
+            pressure_divisor: load_touch_settings(),
             gesture: None,
             posts: Vec::new(),
         })
@@ -717,6 +705,23 @@ impl Host {
             && self.ctx.layer_id_at(p).is_none_or(|l| l.order == egui::Order::Background)
     }
 
+    /// The Pencil force (1.0 is an average touch) turned into a 0..1 pressure, with the
+    /// `pressure_divisor` setting how hard the Pencil must be pressed. A felt tip has a dead
+    /// zone and tapers in and out: the first and last samples of a stroke are never hard, and
+    /// a light lift barely marks the paper.
+    fn pressure_curve(&self, force: f32, phase: i32) -> f32 {
+        let raw = (force / self.pressure_divisor).clamp(0.0, 1.0);
+        if phase == 0 {
+            // The tip is just touching: nothing marks until it presses in.
+            return (raw * 2.0).min(1.0);
+        }
+        if phase == 2 {
+            // Lifting off: the pressure falls away before the tip leaves.
+            return raw * 0.5;
+        }
+        raw
+    }
+
     /// An event for a few frames from now.
     fn post(&mut self, frames: u8, e: egui::Event) {
         self.posts.push((frames, e));
@@ -767,10 +772,7 @@ impl Host {
             GMode::Pending => {
                 let (sx, sy) = g.start;
                 let (dx, dy) = (x - sx, y - sy);
-                if dx * dx + dy * dy <= 64.0 {
-                    return;
-                }
-                let draws = g.pen || self.finger_draws;
+                let draws = g.pen;
                 use egui::CursorIcon as C;
                 // The app shows a resize or grab cursor over handles: those are dragged, never scrolled.
                 let handle = matches!(
@@ -779,8 +781,11 @@ impl Host {
                         | C::ResizeNorth | C::ResizeSouth | C::ResizeNorthEast | C::ResizeNorthWest | C::ResizeSouthEast
                         | C::ResizeSouthWest | C::ResizeColumn | C::ResizeRow | C::Grab | C::Grabbing | C::Move | C::AllScroll
                 );
+                // A drag starts the moment the finger moves far enough to be a drag. A scroll or a
+                // pan waits a little longer, so a light tap on a panel does not scroll it.
                 let pointer = if g.host_ui || handle { true } else if g.on_canvas { draws } else { dy.abs() <= dx.abs() * 1.2 };
                 if pointer {
+                    if dx * dx + dy * dy <= 64.0 { return; }
                     g.mode = GMode::Pointer;
                     let sp = self.pt(sx, sy);
                     let cp = self.pt(x, y);
@@ -788,6 +793,8 @@ impl Host {
                     self.push(egui::Event::PointerMoved(sp));
                     self.push(egui::Event::PointerButton { pos: sp, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
                     self.push(egui::Event::PointerMoved(cp));
+                } else if dx * dx + dy * dy <= 256.0 {
+                    return;
                 } else {
                     // A finger on the picture pans it; a finger dragging up or down on a panel or
                     // menu scrolls it.
@@ -814,11 +821,12 @@ impl Host {
         let Some(g) = self.gesture.take() else { return };
         match g.mode {
             GMode::Pending => {
-                let draws = g.pen || self.finger_draws;
+                let draws = g.pen;
                 let quick = g.t0.elapsed() < Duration::from_millis(500);
-                // A quick tap clicks. A tap on the picture with a finger does nothing, unless
-                // fingers are set to draw.
-                if !cancelled && !g.consumed && quick && !(g.on_canvas && !draws) {
+                // A quick tap clicks. Only the Pencil taps the picture; a finger tap on the
+                // picture is a nudge, never a select. A finger on our own buttons (the assist
+                // puck, the undo column) still taps them.
+                if !cancelled && !g.consumed && quick && (g.host_ui || draws) {
                     self.click(g.start.0, g.start.1, egui::PointerButton::Primary, false);
                 }
             }
@@ -846,18 +854,13 @@ impl Host {
             TouchAction::Undo => self.key_tap(egui::Key::Z, cmd),
             TouchAction::Redo => self.key_tap(egui::Key::Z, to_mods(9)),
             TouchAction::Delete => self.key_tap(egui::Key::Backspace, egui::Modifiers::NONE),
-            TouchAction::ToggleFinger => {
-                self.finger_draws = !self.finger_draws;
-                self.gesture = None;
-                save_touch_settings(self.finger_draws, self.pressure_divisor);
-            }
             TouchAction::Softer => {
                 self.pressure_divisor = (self.pressure_divisor - 0.3).max(1.0);
-                save_touch_settings(self.finger_draws, self.pressure_divisor);
+                save_touch_settings(self.pressure_divisor);
             }
             TouchAction::Firmer => {
                 self.pressure_divisor = (self.pressure_divisor + 0.3).min(5.0);
-                save_touch_settings(self.finger_draws, self.pressure_divisor);
+                save_touch_settings(self.pressure_divisor);
             }
         }
     }
@@ -942,7 +945,7 @@ impl Host {
         eframe::App::raw_input_hook(&mut self.app, &ctx, &mut raw);
         // One pass, like eframe itself: the app's logic (shortcuts, typing) runs inside the UI pass.
         let mut actions: Vec<TouchAction> = Vec::new();
-        let (finger_draws, divisor) = (self.finger_draws, self.pressure_divisor);
+        let divisor = self.pressure_divisor;
         let touch = &mut self.touch;
         let mut full = ctx.run_ui(raw, |ui| {
             // Panel edges and splitters get a much wider grab area, so a fingertip can find them.
@@ -956,7 +959,7 @@ impl Host {
             }
             eframe::App::logic(&mut self.app, ui.ctx(), &mut self.frame);
             eframe::App::ui(&mut self.app, ui, &mut self.frame);
-            touch_ui(ui.ctx(), rect, self.app.last_canvas_rect, touch, finger_draws, divisor, &mut actions);
+            touch_ui(ui.ctx(), rect, self.app.last_canvas_rect, touch, divisor, &mut actions);
         });
         self.cursor = full.platform_output.cursor_icon;
         self.refresh_mods();
@@ -1201,9 +1204,11 @@ pub unsafe extern "C" fn pc_pen(
         let pos = h.pt(x, y);
         let m = h.modifiers;
         // The shell sends the Pencil's force (1.0 is an average touch); full pressure is reached
-        // at `pressure_divisor`.
+        // at `pressure_divisor`. The curve is what a felt tip feels like: a dead zone at the
+        // start, a taper in as the stroke begins and out as it ends, so the first and last
+        // samples are never hard.
         let sample = PenSample {
-            pressure: (pressure / h.pressure_divisor).clamp(0.0, 1.0),
+            pressure: h.pressure_curve(pressure, phase),
             tilt_x,
             tilt_y,
             rotation: rotation.rem_euclid(360.0),
@@ -1272,8 +1277,9 @@ pub unsafe extern "C" fn pc_pen_hover_end(h: *mut c_void) {
     }
 }
 
-/// A finger. phase: 0 touches down, 1 moves, 2 lifts, 3 is cancelled. One finger taps, scrolls
-/// panels, pans the picture, or (when fingers are set to draw) draws; the Rust side decides.
+/// A finger. phase: 0 touches down, 1 moves, 2 lifts, 3 is cancelled. One finger taps our own
+/// buttons, scrolls panels, pans the picture and opens menus; it never draws or selects on the
+/// picture itself - only the Pencil and the mouse do that.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_finger(h: *mut c_void, phase: c_int, x: f32, y: f32, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
@@ -1328,14 +1334,6 @@ pub unsafe extern "C" fn pc_set_touch_shift(h: *mut c_void, on: c_int) {
     }
 }
 
-/// Fingers draw (1) or only pan and zoom the picture (0).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pc_set_finger_draw(h: *mut c_void, on: c_int) {
-    if let Some(h) = unsafe { host(h) } {
-        h.finger_draws = on != 0;
-    }
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_scroll(h: *mut c_void, dx: f32, dy: f32, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
@@ -1354,6 +1352,14 @@ pub unsafe extern "C" fn pc_zoom(h: *mut c_void, factor: f32, x: f32, y: f32) {
         let p = h.pt(x, y);
         h.push(egui::Event::PointerMoved(p));
         h.push(egui::Event::Zoom(factor));
+    }
+}
+
+/// A two-finger twist: rotates the picture, like turning a trackpad with two fingers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_rotate(h: *mut c_void, radians: f32) {
+    if let Some(h) = unsafe { host(h) } {
+        h.push(egui::Event::Rotate(radians));
     }
 }
 
